@@ -1,0 +1,589 @@
+From ecb123357e20e6108f1f674feb4be1ec3169660c Mon Sep 17 00:00:00 2001
+From: crypto-services <hossein.khoshtaghaza@republiccrypto.com>
+Date: Mon, 15 Dec 2025 14:03:27 +0800
+Subject: [PATCH] Add patch
+
+---
+ Cargo.toml                                    |   4 +
+ crates/sui-core/Cargo.toml                    |   4 +
+ crates/sui-core/src/authority.rs              | 102 ++++++++++-
+ crates/sui-core/src/cache_update_handler.rs   | 158 ++++++++++++++++++
+ crates/sui-core/src/execution_cache.rs        |   8 +
+ .../src/execution_cache/writeback_cache.rs    |  53 ++++++
+ crates/sui-core/src/lib.rs                    |   5 +
+ crates/sui-core/src/tx_handler.rs             | 107 ++++++++++++
+ 8 files changed, 440 insertions(+), 1 deletion(-)
+ create mode 100644 crates/sui-core/src/cache_update_handler.rs
+ create mode 100644 crates/sui-core/src/tx_handler.rs
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 5b0f0de9a2..0eb0db04c3 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -798,6 +798,10 @@ sui-execution = { path = "sui-execution" }
+ # move-vm-runtime = { path = "external-crates/move/move-vm/runtime" }
+ # move-bytecode-verifier = { path = "external-crates/move/move-bytecode-verifier" }
+ 
++# Modification starts
++interprocess = { version = "2", features = ["tokio"] }
++# Modification ends
++
+ [patch.crates-io]
+ async-graphql = { git = "https://github.com/amnn/async-graphql", branch = "v7.0.1-react-18-graphiql-4" }
+ async-graphql-axum = { git = "https://github.com/amnn/async-graphql", branch = "v7.0.1-react-18-graphiql-4" }
+diff --git a/crates/sui-core/Cargo.toml b/crates/sui-core/Cargo.toml
+index f479833246..b5043a6373 100644
+--- a/crates/sui-core/Cargo.toml
++++ b/crates/sui-core/Cargo.toml
+@@ -95,6 +95,10 @@ sui-tls.workspace = true
+ sui-types.workspace = true
+ nonempty.workspace = true
+ 
++# Modifications start
++interprocess.workspace = true
++# Modifications end
++
+ [dev-dependencies]
+ sui-move-build.workspace = true
+ clap.workspace = true
+diff --git a/crates/sui-core/src/authority.rs b/crates/sui-core/src/authority.rs
+index e74ceb8b28..73c773436d 100644
+--- a/crates/sui-core/src/authority.rs
++++ b/crates/sui-core/src/authority.rs
+@@ -199,6 +199,12 @@ use crate::validator_tx_finalizer::ValidatorTxFinalizer;
+ use sui_types::committee::CommitteeTrait;
+ use sui_types::deny_list_v2::check_coin_deny_list_v2_during_signing;
+ 
++// Modifications start
++use crate::cache_update_handler::{indexer_related_object_ids, CacheUpdateHandler};
++use crate::tx_handler::TxHandler;
++use dashmap::DashSet;
++// Modifications end
++
+ #[cfg(test)]
+ #[path = "unit_tests/authority_tests.rs"]
+ pub mod authority_tests;
+@@ -967,6 +973,17 @@ pub struct AuthorityState {
+ 
+     /// Fork recovery state for handling equivocation after forks
+     fork_recovery_state: Option<ForkRecoveryState>,
++
++    // Modifications start
++    /// Handler for streaming cache updates to custom indexer
++    pub cache_update_handler: CacheUpdateHandler,
++
++    /// Handler for streaming transaction effects/events to custom indexer
++    pub tx_handler: TxHandler,
++
++    /// Set of indexer-related object IDs to monitor
++    pub indexer_ids: DashSet<ObjectID>,
++    // Modifications end
+ }
+ 
+ /// The authority state encapsulates all state, drives execution, and ensures safety.
+@@ -1953,7 +1970,79 @@ impl AuthorityState {
+         fail_point!("crash");
+ 
+         self.get_cache_writer()
+-            .write_transaction_outputs(epoch_store.epoch(), transaction_outputs);
++            // Modifications start
++            .write_transaction_outputs(epoch_store.epoch(), Arc::clone(&transaction_outputs));
++            // Modifications end
++
++        // Modifications start
++        // Notify indexer of changes via socket
++        if !certificate.transaction_data().is_system_tx() {
++            // Notify cache updates for targeted objects
++            let changed_objects: Vec<_> = transaction_outputs
++                .written
++                .iter()
++                .filter_map(|(id, obj)| {
++                    // Check if object is targeted or owned by us
++                    let owned_by_us = std::env::var("OUR_ADDRESS")
++                        .ok()
++                        .and_then(|addr| ObjectID::from_str(&addr).ok())
++                        .map(|target| obj.owner() == &Owner::AddressOwner(target.into()))
++                        .unwrap_or(false);
++
++                    if self.indexer_ids.contains(id) || owned_by_us {
++                        Some((*id, obj.clone()))
++                    } else {
++                        None
++                    }
++                })
++                .collect();
++
++            if !changed_objects.is_empty() {
++                let handler = self.cache_update_handler.clone();
++                tokio::spawn(async move {
++                    handler.notify_written(changed_objects).await;
++                });
++            }
++
++            // Stream transaction effects and events
++            let raw_events = &transaction_outputs.events;
++            if !raw_events.data.is_empty() {
++                let tx_digest = certificate.digest();
++                let backing_store = self.get_backing_package_store().clone();
++                let executor = epoch_store.executor();
++
++                // Convert events to SuiEvent format
++                let sui_events: Vec<SuiEvent> = raw_events
++                    .data
++                    .iter()
++                    .enumerate()
++                    .filter_map(|(seq, event)| {
++                        let mut layout_resolver =
++                            executor.type_layout_resolver(Box::new(backing_store.as_ref()));
++                        match layout_resolver.get_annotated_layout(&event.type_) {
++                            Ok(layout) => SuiEvent::try_from(
++                                event.clone(),
++                                *tx_digest,
++                                seq as u64,
++                                None,
++                                layout,
++                            )
++                            .ok(),
++                            Err(_) => None,
++                        }
++                    })
++                    .collect();
++
++                if !sui_events.is_empty() {
++                    let tx_handler = self.tx_handler.clone();
++                    let effects = transaction_outputs.effects.clone();
++                    tokio::spawn(async move {
++                        let _ = tx_handler.send_tx_effects_and_events(&effects, sui_events).await;
++                    });
++                }
++            }
++        }
++        // Modifications end
+ 
+         if certificate.transaction_data().is_end_of_epoch_tx() {
+             // At the end of epoch, since system packages may have been upgraded, force
+@@ -3622,6 +3711,12 @@ impl AuthorityState {
+                 .expect("Failed to initialize fork recovery state")
+         });
+ 
++        // Modifications start
++        let cache_update_handler = CacheUpdateHandler::new();
++        let tx_handler = TxHandler::default();
++        let indexer_ids = indexer_related_object_ids();
++        // Modifications end
++
+         let state = Arc::new(AuthorityState {
+             name,
+             secret,
+@@ -3647,6 +3742,11 @@ impl AuthorityState {
+             congestion_tracker: Arc::new(CongestionTracker::new()),
+             traffic_controller,
+             fork_recovery_state,
++            // Modifications start
++            cache_update_handler,
++            tx_handler,
++            indexer_ids,
++            // Modifications end
+         });
+ 
+         let state_clone = Arc::downgrade(&state);
+diff --git a/crates/sui-core/src/cache_update_handler.rs b/crates/sui-core/src/cache_update_handler.rs
+new file mode 100644
+index 0000000000..c1958346d3
+--- /dev/null
++++ b/crates/sui-core/src/cache_update_handler.rs
+@@ -0,0 +1,158 @@
++use std::path::PathBuf;
++use std::sync::{
++    atomic::{AtomicBool, Ordering},
++    Arc,
++};
++
++use dashmap::DashSet;
++use once_cell::sync::Lazy;
++use sui_types::base_types::ObjectID;
++use sui_types::object::Object;
++use tokio::io::AsyncWriteExt;
++use tokio::net::{UnixListener, UnixStream};
++use tokio::sync::Mutex;
++use tracing::{error, info};
++
++/// Socket path for cache update streaming.
++/// Configurable via SUI_CACHE_SOCKET_PATH environment variable.
++pub static SOCKET_PATH: Lazy<String> = Lazy::new(|| {
++    std::env::var("SUI_CACHE_SOCKET_PATH")
++        .unwrap_or_else(|_| "/tmp/sui_cache_updates.sock".to_string())
++});
++
++/// Path to file containing indexer-related object IDs to monitor.
++/// Configurable via SUI_INDEXER_OBJECTS_PATH environment variable.
++pub static INDEXER_OBJECTS_PATH: Lazy<String> = Lazy::new(|| {
++    std::env::var("SUI_INDEXER_OBJECTS_PATH")
++        .unwrap_or_else(|_| "/tmp/indexer_ids.txt".to_string())
++});
++
++/// Load indexer-related object IDs from file.
++/// These are the objects we want to monitor for changes.
++pub fn indexer_related_object_ids() -> DashSet<ObjectID> {
++    let content = match std::fs::read_to_string(&*INDEXER_OBJECTS_PATH) {
++        Ok(c) => c,
++        Err(e) => {
++            error!("Failed to read indexer_ids file: {}", e);
++            return DashSet::new();
++        }
++    };
++
++    let set = DashSet::new();
++    for line in content.trim().lines() {
++        if let Ok(id) = line.parse() {
++            set.insert(id);
++        }
++    }
++    set
++}
++
++#[derive(Debug)]
++pub struct CacheUpdateHandler {
++    socket_path: Arc<PathBuf>,
++    connections: Arc<Mutex<Vec<UnixStream>>>,
++    running: Arc<AtomicBool>,
++}
++
++impl Clone for CacheUpdateHandler {
++    fn clone(&self) -> Self {
++        Self {
++            socket_path: Arc::clone(&self.socket_path),
++            connections: Arc::clone(&self.connections),
++            running: Arc::clone(&self.running),
++        }
++    }
++}
++
++impl Default for CacheUpdateHandler {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl CacheUpdateHandler {
++    pub fn new() -> Self {
++        let socket_path = Arc::new(PathBuf::from(&*SOCKET_PATH));
++
++        // Remove existing socket file if it exists
++        let _ = std::fs::remove_file(socket_path.as_ref());
++
++        let listener = UnixListener::bind(socket_path.as_ref())
++            .expect("Failed to bind cache update Unix socket");
++
++        let connections = Arc::new(Mutex::new(Vec::new()));
++        let running = Arc::new(AtomicBool::new(true));
++
++        let connections_clone = Arc::clone(&connections);
++        let running_clone = Arc::clone(&running);
++
++        // Spawn connection acceptor task
++        tokio::spawn(async move {
++            while running_clone.load(Ordering::SeqCst) {
++                match listener.accept().await {
++                    Ok((stream, _addr)) => {
++                        info!("New client connected to cache update socket");
++                        connections_clone.lock().await.push(stream);
++                    }
++                    Err(e) => {
++                        error!("Error accepting cache update connection: {}", e);
++                    }
++                }
++            }
++        });
++
++        Self {
++            socket_path,
++            connections,
++            running,
++        }
++    }
++
++    /// Notify all connected clients of written objects.
++    ///
++    /// Wire format:
++    /// - len (4 bytes, little-endian u32)
++    /// - payload (BCS serialized Vec<(ObjectID, Object)>)
++    pub async fn notify_written(&self, objects: Vec<(ObjectID, Object)>) {
++        let serialized = match bcs::to_bytes(&objects) {
++            Ok(s) => s,
++            Err(e) => {
++                error!("Failed to serialize cache update: {}", e);
++                return;
++            }
++        };
++
++        let len_bytes = (serialized.len() as u32).to_le_bytes();
++
++        let mut connections = self.connections.lock().await;
++        let mut i = 0;
++
++        while i < connections.len() {
++            let stream = &mut connections[i];
++
++            let result = async {
++                stream.write_all(&len_bytes).await?;
++                stream.write_all(&serialized).await?;
++                Ok::<_, std::io::Error>(())
++            }
++            .await;
++
++            if result.is_err() {
++                // Remove failed connection
++                connections.remove(i);
++            } else {
++                i += 1;
++            }
++        }
++    }
++}
++
++impl Drop for CacheUpdateHandler {
++    fn drop(&mut self) {
++        // Only clean up when this is the last reference
++        if Arc::strong_count(&self.socket_path) == 1 {
++            self.running.store(false, Ordering::SeqCst);
++            let _ = std::fs::remove_file(self.socket_path.as_ref());
++        }
++    }
++}
+diff --git a/crates/sui-core/src/execution_cache.rs b/crates/sui-core/src/execution_cache.rs
+index 6fb89d6669..bac4e2470d 100644
+--- a/crates/sui-core/src/execution_cache.rs
++++ b/crates/sui-core/src/execution_cache.rs
+@@ -607,6 +607,14 @@ pub trait ExecutionCacheWrite: Send + Sync {
+         signed_transaction: Option<VerifiedSignedTransaction>,
+     ) -> SuiResult;
+ 
++    // Modifications start
++    /// Reload objects into cache. Called when receiving updates from socket.
++    fn reload_objects(&self, objects: Vec<(ObjectID, Object)>);
++
++    /// Sync with underlying RocksDB and optionally clear cache.
++    fn update_underlying(&self, clear_cache: bool);
++    // Modifications end
++
+     /// Write an object entry directly to the cache for testing.
+     /// This allows us to write an object without constructing the entire
+     /// transaction outputs.
+diff --git a/crates/sui-core/src/execution_cache/writeback_cache.rs b/crates/sui-core/src/execution_cache/writeback_cache.rs
+index a4066f0930..f65c4fa884 100644
+--- a/crates/sui-core/src/execution_cache/writeback_cache.rs
++++ b/crates/sui-core/src/execution_cache/writeback_cache.rs
+@@ -85,6 +85,10 @@ use sui_types::transaction::{TransactionDataAPI, VerifiedSignedTransaction, Veri
+ use tap::TapOptional;
+ use tracing::{debug, info, instrument, trace, warn};
+ 
++// Modifications start
++use typed_store::traits::{Map};
++// Modifications end
++
+ use super::ExecutionCacheAPI;
+ use super::cache_types::Ticket;
+ use super::{
+@@ -413,6 +417,18 @@ impl CachedCommittedData {
+         assert!(self.executed_effects_digests.is_empty());
+         assert_empty(&self._transaction_objects);
+     }
++
++    // Modifications start
++    fn clear(&self) {
++        self.object_cache.invalidate_all();
++        self.marker_cache.invalidate_all();
++        self.transactions.invalidate_all();
++        self.transaction_effects.invalidate_all();
++        self.transaction_events.invalidate_all();
++        self.executed_effects_digests.invalidate_all();
++        self._transaction_objects.invalidate_all();
++    }
++    // Modifications end
+ }
+ 
+ fn assert_empty<K, V>(cache: &MokaCache<K, V>)
+@@ -1358,6 +1374,24 @@ impl WritebackCache {
+         self.packages.invalidate_all();
+         assert_empty(&self.packages);
+     }
++
++    // Modifications start
++    /// Insert objects directly into the cache.
++    pub fn reload_cached(&self, objects: Vec<(ObjectID, Object)>) {
++        for (object_id, object) in objects {
++            let _ = self.object_by_id_cache.insert(
++                &object_id,
++                LatestObjectCacheEntry::Object(object.version(), object.into()),
++                Ticket::Write,
++            );
++        }
++    }
++
++    /// Clear all cached data.
++    pub fn clear(&self) {
++        self.cached.clear();
++    }
++    // Modifications end
+ }
+ 
+ impl ExecutionCacheAPI for WritebackCache {}
+@@ -2247,6 +2281,25 @@ impl ExecutionCacheWrite for WritebackCache {
+             .notify(&tx_digest, &tx_outputs);
+     }
+ 
++    // Modifications start
++    fn reload_objects(&self, objects: Vec<(ObjectID, Object)>) {
++        self.reload_cached(objects);
++    }
++
++    fn update_underlying(&self, clear_cache: bool) {
++        // Sync RocksDB secondary with primary
++        self.store
++            .perpetual_tables
++            .objects
++            .try_catch_up_with_primary()
++            .unwrap();
++
++        if clear_cache {
++            self.clear();
++        }
++    }
++    // Modifications end
++
+     #[cfg(test)]
+     fn write_object_entry_for_test(&self, object: Object) {
+         self.write_object_entry(&object.id(), object.version(), object.into());
+diff --git a/crates/sui-core/src/lib.rs b/crates/sui-core/src/lib.rs
+index bb3746a9dd..06cd29a921 100644
+--- a/crates/sui-core/src/lib.rs
++++ b/crates/sui-core/src/lib.rs
+@@ -55,6 +55,11 @@ pub mod validator_client_monitor;
+ pub mod validator_tx_finalizer;
+ pub mod verify_indexes;
+ 
++// Modifications start
++pub mod cache_update_handler;
++pub mod tx_handler;
++// Modifications end
++
+ #[cfg(test)]
+ #[path = "unit_tests/congestion_control_tests.rs"]
+ mod congestion_control_tests;
+diff --git a/crates/sui-core/src/tx_handler.rs b/crates/sui-core/src/tx_handler.rs
+new file mode 100644
+index 0000000000..8e90077fb4
+--- /dev/null
++++ b/crates/sui-core/src/tx_handler.rs
+@@ -0,0 +1,107 @@
++use std::sync::Arc;
++
++use anyhow::Result;
++use interprocess::local_socket::{
++    tokio::{prelude::*, Stream},
++    GenericNamespaced, ListenerOptions,
++};
++use once_cell::sync::Lazy;
++use sui_json_rpc_types::SuiEvent;
++use sui_types::effects::TransactionEffects;
++use tokio::{io::AsyncWriteExt, sync::Mutex};
++
++/// Socket path for transaction effects/events streaming.
++/// Configurable via SUI_TX_SOCKET_PATH environment variable.
++pub static TX_SOCKET_PATH: Lazy<String> = Lazy::new(|| {
++    std::env::var("SUI_TX_SOCKET_PATH")
++        .unwrap_or_else(|_| "/tmp/sui_tx.sock".to_string())
++});
++
++#[derive(Clone)]
++pub struct TxHandler {
++    path: String,
++    conns: Arc<Mutex<Vec<Stream>>>,
++}
++
++impl Default for TxHandler {
++    fn default() -> Self {
++        Self::new(&TX_SOCKET_PATH)
++    }
++}
++
++impl Drop for TxHandler {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_file(&self.path);
++    }
++}
++
++impl TxHandler {
++    pub fn new(path: &str) -> Self {
++        let _ = std::fs::remove_file(path);
++
++        let name = path
++            .to_ns_name::<GenericNamespaced>()
++            .expect("Invalid tx socket path");
++        let opts = ListenerOptions::new().name(name);
++        let listener = opts.create_tokio().expect("Failed to bind tx socket");
++        let conns = Arc::new(Mutex::new(vec![]));
++        let conns_clone = conns.clone();
++
++        tokio::spawn(async move {
++            loop {
++                match listener.accept().await {
++                    Ok(conn) => {
++                        conns_clone.lock().await.push(conn);
++                    }
++                    Err(_) => continue,
++                }
++            }
++        });
++
++        Self {
++            path: path.to_string(),
++            conns,
++        }
++    }
++
++    /// Send transaction effects and events to all connected clients.
++    ///
++    /// Wire format:
++    /// - effects_len (4 bytes, big-endian u32)
++    /// - effects (bincode serialized TransactionEffects)
++    /// - events_len (4 bytes, big-endian u32)
++    /// - events (JSON serialized Vec<SuiEvent>)
++    pub async fn send_tx_effects_and_events(
++        &self,
++        effects: &TransactionEffects,
++        events: Vec<SuiEvent>,
++    ) -> Result<()> {
++        let effects_bytes = bincode::serialize(effects)?;
++        let events_bytes = serde_json::to_vec(&events)?;
++
++        let effects_len_bytes = (effects_bytes.len() as u32).to_be_bytes();
++        let events_len_bytes = (events_bytes.len() as u32).to_be_bytes();
++
++        let mut conns = self.conns.lock().await;
++        let mut active_conns = Vec::new();
++
++        while let Some(mut conn) = conns.pop() {
++            let result: Result<()> = async {
++                conn.write_all(&effects_len_bytes).await?;
++                conn.write_all(&effects_bytes).await?;
++                conn.write_all(&events_len_bytes).await?;
++                conn.write_all(&events_bytes).await?;
++                Ok(())
++            }
++            .await;
++
++            if result.is_ok() {
++                active_conns.push(conn);
++            }
++            // Failed connections are dropped (not re-added)
++        }
++
++        *conns = active_conns;
++        Ok(())
++    }
++}
+-- 
+2.39.3 (Apple Git-145)
+
