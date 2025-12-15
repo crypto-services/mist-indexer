@@ -607,6 +607,14 @@ pub trait ExecutionCacheWrite: Send + Sync {
         signed_transaction: Option<VerifiedSignedTransaction>,
     ) -> SuiResult;
 
+    // Modifications start
+    /// Reload objects into cache. Called when receiving updates from socket.
+    fn reload_objects(&self, objects: Vec<(ObjectID, Object)>);
+
+    /// Sync with underlying RocksDB and optionally clear cache.
+    fn update_underlying(&self, clear_cache: bool);
+    // Modifications end
+
     /// Write an object entry directly to the cache for testing.
     /// This allows us to write an object without constructing the entire
     /// transaction outputs.

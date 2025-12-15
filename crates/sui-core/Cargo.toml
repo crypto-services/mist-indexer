@@ -95,6 +95,10 @@ sui-tls.workspace = true
 sui-types.workspace = true
 nonempty.workspace = true
 
+# Modifications start
+interprocess.workspace = true
+# Modifications end
+
 [dev-dependencies]
 sui-move-build.workspace = true
 clap.workspace = true

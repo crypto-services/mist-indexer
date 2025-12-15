@@ -199,6 +199,12 @@ use crate::validator_tx_finalizer::ValidatorTxFinalizer;
 use sui_types::committee::CommitteeTrait;
 use sui_types::deny_list_v2::check_coin_deny_list_v2_during_signing;
 
+// Modifications start
+use crate::cache_update_handler::{indexer_related_object_ids, CacheUpdateHandler};
+use crate::tx_handler::TxHandler;
+use dashmap::DashSet;
+// Modifications end
+
 #[cfg(test)]
 #[path = "unit_tests/authority_tests.rs"]
 pub mod authority_tests;
@@ -967,6 +973,17 @@ pub struct AuthorityState {
 
     /// Fork recovery state for handling equivocation after forks
     fork_recovery_state: Option<ForkRecoveryState>,
+
+    // Modifications start
+    /// Handler for streaming cache updates to custom indexer
+    pub cache_update_handler: CacheUpdateHandler,
+
+    /// Handler for streaming transaction effects/events to custom indexer
+    pub tx_handler: TxHandler,
+
+    /// Set of indexer-related object IDs to monitor
+    pub indexer_ids: DashSet<ObjectID>,
+    // Modifications end
 }
 
 /// The authority state encapsulates all state, drives execution, and ensures safety.
@@ -1953,7 +1970,79 @@ impl AuthorityState {
         fail_point!("crash");
 
         self.get_cache_writer()
-            .write_transaction_outputs(epoch_store.epoch(), transaction_outputs);
+            // Modifications start
+            .write_transaction_outputs(epoch_store.epoch(), Arc::clone(&transaction_outputs));
+            // Modifications end
+
+        // Modifications start
+        // Notify indexer of changes via socket
+        if !certificate.transaction_data().is_system_tx() {
+            // Notify cache updates for targeted objects
+            let changed_objects: Vec<_> = transaction_outputs
+                .written
+                .iter()
+                .filter_map(|(id, obj)| {
+                    // Check if object is targeted or owned by us
+                    let owned_by_us = std::env::var("OUR_ADDRESS")
+                        .ok()
+                        .and_then(|addr| ObjectID::from_str(&addr).ok())
+                        .map(|target| obj.owner() == &Owner::AddressOwner(target.into()))
+                        .unwrap_or(false);
+
+                    if self.indexer_ids.contains(id) || owned_by_us {
+                        Some((*id, obj.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !changed_objects.is_empty() {
+                let handler = self.cache_update_handler.clone();
+                tokio::spawn(async move {
+                    handler.notify_written(changed_objects).await;
+                });
+            }
+
+            // Stream transaction effects and events
+            let raw_events = &transaction_outputs.events;
+            if !raw_events.data.is_empty() {
+                let tx_digest = certificate.digest();
+                let backing_store = self.get_backing_package_store().clone();
+                let executor = epoch_store.executor();
+
+                // Convert events to SuiEvent format
+                let sui_events: Vec<SuiEvent> = raw_events
+                    .data
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(seq, event)| {
+                        let mut layout_resolver =
+                            executor.type_layout_resolver(Box::new(backing_store.as_ref()));
+                        match layout_resolver.get_annotated_layout(&event.type_) {
+                            Ok(layout) => SuiEvent::try_from(
+                                event.clone(),
+                                *tx_digest,
+                                seq as u64,
+                                None,
+                                layout,
+                            )
+                            .ok(),
+                            Err(_) => None,
+                        }
+                    })
+                    .collect();
+
+                if !sui_events.is_empty() {
+                    let tx_handler = self.tx_handler.clone();
+                    let effects = transaction_outputs.effects.clone();
+                    tokio::spawn(async move {
+                        let _ = tx_handler.send_tx_effects_and_events(&effects, sui_events).await;
+                    });
+                }
+            }
+        }
+        // Modifications end
 
         if certificate.transaction_data().is_end_of_epoch_tx() {
             // At the end of epoch, since system packages may have been upgraded, force
@@ -3622,6 +3711,12 @@ impl AuthorityState {
                 .expect("Failed to initialize fork recovery state")
         });
 
+        // Modifications start
+        let cache_update_handler = CacheUpdateHandler::new();
+        let tx_handler = TxHandler::default();
+        let indexer_ids = indexer_related_object_ids();
+        // Modifications end
+
         let state = Arc::new(AuthorityState {
             name,
             secret,
@@ -3647,6 +3742,11 @@ impl AuthorityState {
             congestion_tracker: Arc::new(CongestionTracker::new()),
             traffic_controller,
             fork_recovery_state,
+            // Modifications start
+            cache_update_handler,
+            tx_handler,
+            indexer_ids,
+            // Modifications end
         });
 
         let state_clone = Arc::downgrade(&state);

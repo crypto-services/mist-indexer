@@ -55,6 +55,11 @@ pub mod validator_client_monitor;
 pub mod validator_tx_finalizer;
 pub mod verify_indexes;
 
+// Modifications start
+pub mod cache_update_handler;
+pub mod tx_handler;
+// Modifications end
+
 #[cfg(test)]
 #[path = "unit_tests/congestion_control_tests.rs"]
 mod congestion_control_tests;

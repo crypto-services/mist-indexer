@@ -85,6 +85,10 @@ use sui_types::transaction::{TransactionDataAPI, VerifiedSignedTransaction, Veri
 use tap::TapOptional;
 use tracing::{debug, info, instrument, trace, warn};
 
+// Modifications start
+use typed_store::traits::{Map};
+// Modifications end
+
 use super::ExecutionCacheAPI;
 use super::cache_types::Ticket;
 use super::{
@@ -413,6 +417,18 @@ impl CachedCommittedData {
         assert!(self.executed_effects_digests.is_empty());
         assert_empty(&self._transaction_objects);
     }
+
+    // Modifications start
+    fn clear(&self) {
+        self.object_cache.invalidate_all();
+        self.marker_cache.invalidate_all();
+        self.transactions.invalidate_all();
+        self.transaction_effects.invalidate_all();
+        self.transaction_events.invalidate_all();
+        self.executed_effects_digests.invalidate_all();
+        self._transaction_objects.invalidate_all();
+    }
+    // Modifications end
 }
 
 fn assert_empty<K, V>(cache: &MokaCache<K, V>)
@@ -1358,6 +1374,24 @@ impl WritebackCache {
         self.packages.invalidate_all();
         assert_empty(&self.packages);
     }
+
+    // Modifications start
+    /// Insert objects directly into the cache.
+    pub fn reload_cached(&self, objects: Vec<(ObjectID, Object)>) {
+        for (object_id, object) in objects {
+            let _ = self.object_by_id_cache.insert(
+                &object_id,
+                LatestObjectCacheEntry::Object(object.version(), object.into()),
+                Ticket::Write,
+            );
+        }
+    }
+
+    /// Clear all cached data.
+    pub fn clear(&self) {
+        self.cached.clear();
+    }
+    // Modifications end
 }
 
 impl ExecutionCacheAPI for WritebackCache {}
@@ -2246,6 +2280,25 @@ impl ExecutionCacheWrite for WritebackCache {
         self.fastpath_transaction_outputs_notify_read
             .notify(&tx_digest, &tx_outputs);
     }
+
+    // Modifications start
+    fn reload_objects(&self, objects: Vec<(ObjectID, Object)>) {
+        self.reload_cached(objects);
+    }
+
+    fn update_underlying(&self, clear_cache: bool) {
+        // Sync RocksDB secondary with primary
+        self.store
+            .perpetual_tables
+            .objects
+            .try_catch_up_with_primary()
+            .unwrap();
+
+        if clear_cache {
+            self.clear();
+        }
+    }
+    // Modifications end
 
     #[cfg(test)]
     fn write_object_entry_for_test(&self, object: Object) {
